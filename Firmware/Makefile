@@ -1,7 +1,7 @@
 # DC34 DEF CON SAO Fuzzer firmware -- ATtiny1614
 
 MCU     := attiny1614
-F_CPU   := 3333333UL
+F_CPU   := 10000000UL
 TARGET  := dc34_fuzzer
 SRC     := main.c
 

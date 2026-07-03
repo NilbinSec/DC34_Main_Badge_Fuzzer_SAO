@@ -13,9 +13,10 @@
  * Optional 9600 8N1 debug log on PA1 (USART0 TXD).
  */
 
-#define F_CPU 3333333UL          /* 20 MHz osc / 6, factory default */
+#define F_CPU 10000000UL         /* 20 MHz osc / 2, set at boot (see clock_init) */
 
 #include <avr/io.h>
+#include <avr/interrupt.h>
 #include <util/delay.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -40,13 +41,10 @@
 #define MODE_WINDOW_MS  350u     /* multi-press detection window          */
 #define M3_LISTEN_MS    75u      /* listen time per slave address         */
 
-/* --- TWI master baud (only used if you switch Mode 3 to scan mode):
- * MBAUD = (F_CPU / (2 * F_SCL)) - 5 ;  for 100 kHz @ 3.333 MHz -> ~11    */
-#define I2C_BAUD        11
-
-/* --- USART0 baud register for 9600 baud @ 3.333 MHz:
- * BAUD = (F_CPU * 64) / (16 * 9600)  ~= 1389                              */
-#define UART_BAUD_REG   1389
+/* --- USART0 baud register for 9600 baud:
+ * BAUD = (F_CPU * 64) / (16 * 9600)  = F_CPU * 4 / 9600.
+ * At F_CPU = 10 MHz: 4166.67 -> use 4167.                                  */
+#define UART_BAUD_REG   4167u
 
 /* ====================================================================== */
 /*  Globals                                                                */
@@ -230,52 +228,107 @@ static void attack_mode2(void)
 }
 
 /* ====================================================================== */
-/*  Mode 3 : I2C slave-listen sweep                                        */
+/*  Mode 3 : bit-banged I2C slave-listen sweep                             */
 /* ====================================================================== */
 /*
- * For each candidate 7-bit address we configure TWI0 as a slave at that
- * address and watch the slave status flag for ~M3_LISTEN_MS.  If the
- * badge's master MCU addresses us, APIF | AP fires; we NACK and complete
- * the transaction (purely passive detection -- we don't pretend to be a
- * functional device).
+ * The ATtiny1614's hardware TWI0 peripheral is physically wired to
+ * PB0 (SCL) / PB1 (SDA) only -- there is no PORTMUX route that lands
+ * SCL on PA3, and tinyAVR does not implement TWI dual-mode.  Since the
+ * SAO carries SDA on PA2 and SCL on PA3, we must snoop the bus in
+ * software using pin-change interrupts.
  *
- * Addresses 0x19 (accel) and 0x3C (OLED) are skipped: real silicon owns
- * those, and bringing up a second responder would collide.
+ * We never drive either line -- purely passive.  Because we don't ACK,
+ * the master sees a NACK for our probed address, which is fine for
+ * detection: we've already latched the address byte on SCL rising
+ * edges by the time the ACK bit rolls around.
+ *
+ * Timing budget @ F_CPU = 10 MHz:
+ *   ISR entry+body+exit ~ 5 us; 100 kHz SCL half-period is 5 us.
+ *   Reliable up to 100 kHz standard-mode I2C.  400 kHz fast-mode may
+ *   drop bits.  Most badges run at 100 kHz.
+ *
+ * Skip list: 0x19 (accel) and 0x3C (OLED) are real silicon on the
+ * badge -- listening on those addresses would cause bus contention.
  */
-static bool listen_as_addr(uint8_t addr, uint16_t listen_ms)
+
+#define BB_STATE_IDLE   0
+#define BB_STATE_ADDR   1
+#define BB_STATE_ACK    2
+
+static volatile uint8_t  bb_state;
+static volatile uint8_t  bb_shift;
+static volatile uint8_t  bb_bits;
+static volatile uint8_t  bb_target;
+static volatile bool     bb_hit;
+
+ISR(PORTA_PORT_vect)
 {
-    /* Make absolutely sure master mode is off, then configure slave. */
-    TWI0.MCTRLA  = 0;
-    TWI0.SADDR   = (uint8_t)(addr << 1);
-    TWI0.SSTATUS = TWI_DIF_bm | TWI_APIF_bm;          /* clear flags  */
-    TWI0.SCTRLA  = TWI_ENABLE_bm;                     /* enable slave */
+    uint8_t flags = PORTA.INTFLAGS;
+    uint8_t inp   = PORTA.IN;
+    uint8_t scl   = inp & PIN_SCL;   /* PA3 */
+    uint8_t sda   = inp & PIN_SDA;   /* PA2 */
 
-    bool hit = false;
-    for (uint16_t t = 0; t < listen_ms; t++) {
-        uint8_t st = TWI0.SSTATUS;
-
-        if (st & TWI_APIF_bm) {
-            if (st & TWI_AP_bm)
-                hit = true;
-            /* Send NACK + complete -- releases the bus either way. */
-            TWI0.SCTRLB  = TWI_ACKACT_NACK_gc | TWI_SCMD_COMPTRANS_gc;
-            TWI0.SSTATUS = TWI_APIF_bm;
-            if (hit) break;
-        } else if (st & TWI_DIF_bm) {
-            TWI0.SCTRLB  = TWI_ACKACT_NACK_gc | TWI_SCMD_COMPTRANS_gc;
-            TWI0.SSTATUS = TWI_DIF_bm;
+    /* SDA edge while SCL high => START (falling) or STOP (rising) */
+    if (flags & PIN_SDA) {
+        if (scl) {
+            if (!sda) {
+                bb_state = BB_STATE_ADDR;
+                bb_bits  = 0;
+                bb_shift = 0;
+            } else {
+                bb_state = BB_STATE_IDLE;
+            }
         }
-        _delay_ms(1);
     }
 
-    TWI0.SCTRLA = 0;
-    return hit;
+    /* SCL rising edge => sample SDA, shift into address register */
+    if (flags & PIN_SCL) {
+        if (bb_state == BB_STATE_ADDR) {
+            bb_shift <<= 1;
+            if (sda)
+                bb_shift |= 1u;
+            if (++bb_bits == 8) {
+                if ((uint8_t)(bb_shift >> 1) == bb_target)
+                    bb_hit = true;
+                bb_state = BB_STATE_ACK;
+            }
+        }
+    }
+
+    PORTA.INTFLAGS = flags;      /* clear handled edges */
+}
+
+static bool bb_listen_as(uint8_t addr, uint16_t listen_ms)
+{
+    /* Both lines as passive inputs; badge bus pull-ups hold them high. */
+    PORTA.DIRCLR = PIN_SDA | PIN_SCL;
+
+    bb_target = addr;
+    bb_hit    = false;
+    bb_state  = BB_STATE_IDLE;
+    bb_bits   = 0;
+    bb_shift  = 0;
+
+    PORTA.INTFLAGS = PIN_SDA | PIN_SCL;         /* clear stale flags */
+
+    PORTA.PIN2CTRL = PORT_ISC_BOTHEDGES_gc;     /* SDA both edges     */
+    PORTA.PIN3CTRL = PORT_ISC_RISING_gc;        /* SCL rising only    */
+
+    sei();
+    for (uint16_t t = 0; t < listen_ms && !bb_hit; t++)
+        _delay_ms(1);
+    cli();
+
+    PORTA.PIN2CTRL = 0;
+    PORTA.PIN3CTRL = 0;
+    PORTA.INTFLAGS = PIN_SDA | PIN_SCL;
+
+    return bb_hit;
 }
 
 static void attack_mode3(void)
 {
-    uart_puts("\r\n[M3] I2C slave-listen sweep\r\n");
-
+    uart_puts("\r\n[M3] I2C bit-bang listen sweep\r\n");
     uint8_t hits = 0;
 
     for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
@@ -286,7 +339,7 @@ static void attack_mode3(void)
         PORTA.OUTTGL = PIN_ACT;
         PORTB.OUTTGL = PIN_MODE;
 
-        if (listen_as_addr(addr, M3_LISTEN_MS)) {
+        if (bb_listen_as(addr, M3_LISTEN_MS)) {
             PORTA.OUTSET = PIN_HIT;
             uart_puts("[M3] HIT 0x");
             uart_hex8(addr);
@@ -340,10 +393,29 @@ static void handle_sw1(void)
 }
 
 /* ====================================================================== */
+/*  Clock init                                                             */
+/* ====================================================================== */
+/*
+ * Boot default: 20 MHz internal osc / 6 = 3.33 MHz.
+ * We want 10 MHz (20 MHz / 2) for enough ISR headroom to snoop I2C in
+ * Mode 3.  Writing MCLKCTRLB is CCP-protected.
+ *
+ * VCC = 3.0 V nominal on the badge; ATtiny1614 is spec'd for 10 MHz
+ * down to 2.7 V, so this is inside envelope.
+ */
+static void clock_init(void)
+{
+    CCP = CCP_IOREG_gc;
+    CLKCTRL.MCLKCTRLB = CLKCTRL_PDIV_2X_gc | CLKCTRL_PEN_bm;
+}
+
+/* ====================================================================== */
 /*  Hardware init                                                          */
 /* ====================================================================== */
 static void hw_init(void)
 {
+    clock_init();
+
     /* LEDs as outputs, off */
     PORTA.DIRSET = PIN_ACT | PIN_HIT | PIN_ERR;
     PORTB.DIRSET = PIN_MODE;
